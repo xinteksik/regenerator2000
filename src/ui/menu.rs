@@ -1265,6 +1265,114 @@ pub fn execute_menu_action(app_state: &mut AppState, ui_state: &mut UIState, act
     }
 }
 
+fn remove_user_labels_in_range(app_state: &mut AppState, start_addr: u16, end_addr: u16) {
+    // Collect addresses with any labels in the range
+    let mut addresses_to_remove = Vec::new();
+
+    for (&addr, labels) in &app_state.labels {
+        if addr >= start_addr && addr <= end_addr && !labels.is_empty() {
+            addresses_to_remove.push(addr);
+        }
+    }
+
+    // Remove ALL labels (User, Auto, and System)
+    for addr in addresses_to_remove {
+        if let Some(old_labels) = app_state.labels.remove(&addr) {
+            // Create undo command for label removal
+            let command = crate::commands::Command::SetLabel {
+                address: addr,
+                new_label: None,
+                old_label: Some(old_labels),
+            };
+            app_state.push_command(command);
+        }
+    }
+}
+
+// Convert all references to a label to DataByte
+// When a label is converted to byte, find all instructions that reference it and convert them too
+fn convert_label_references_to_bytes(app_state: &mut AppState, label_addr: u16) -> bool {
+    // Get all cross-references to this label (all addresses that reference this label)
+    if let Some(xrefs) = app_state.cross_refs.get(&label_addr) {
+        // Safety limit to prevent processing too many references
+        const MAX_XREFS: usize = 100;
+        if xrefs.len() > MAX_XREFS {
+            // Too many references, skip conversion
+            return false;
+        }
+
+        let xref_addresses: Vec<u16> = xrefs.clone();
+
+        // First pass: collect all byte ranges that need to be converted
+        let mut ranges_to_convert = Vec::new();
+        for xref_addr in &xref_addresses {
+            if let Some(line_idx) = app_state.get_line_index_containing_address(*xref_addr) {
+                if let Some(ref_line) = app_state.disassembly.get(line_idx) {
+                    let num_bytes = ref_line.bytes.len();
+                    if num_bytes > 0 {
+                        let start_offset = ref_line.address.wrapping_sub(app_state.origin) as usize;
+                        let end_offset = start_offset + num_bytes - 1;
+
+                        // Additional bounds check
+                        if start_offset < app_state.block_types.len()
+                            && end_offset < app_state.block_types.len()
+                        {
+                            ranges_to_convert.push((start_offset, end_offset));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Second pass: remove all labels in these ranges
+        for (start_offset, end_offset) in &ranges_to_convert {
+            let start_addr = app_state.origin.wrapping_add(*start_offset as u16);
+            let end_addr = app_state.origin.wrapping_add(*end_offset as u16);
+            remove_user_labels_in_range(app_state, start_addr, end_addr);
+        }
+
+        // Third pass: directly modify block_types for all ranges
+        // We do this in one go without calling apply() to avoid intermediate re-analysis
+        let mut all_old_types = Vec::new();
+        for (start_offset, end_offset) in &ranges_to_convert {
+            for i in *start_offset..=*end_offset {
+                if i < app_state.block_types.len() {
+                    all_old_types.push((i, app_state.block_types[i]));
+                    app_state.block_types[i] = crate::state::BlockType::DataByte;
+                }
+            }
+        }
+
+        // Re-analyze once after all changes
+        if !all_old_types.is_empty() {
+            let (new_labels, new_cross_refs) = crate::analyzer::analyze(app_state);
+            app_state.labels = new_labels;
+            app_state.cross_refs = new_cross_refs;
+
+            // Create undo commands for each range
+            for (start_offset, end_offset) in ranges_to_convert {
+                let range = start_offset..(end_offset + 1);
+                let old_types: Vec<crate::state::BlockType> = all_old_types
+                    .iter()
+                    .filter(|(i, _)| *i >= start_offset && *i <= end_offset)
+                    .map(|(_, t)| *t)
+                    .collect();
+
+                if !old_types.is_empty() {
+                    let command = crate::commands::Command::SetBlockType {
+                        range,
+                        new_type: crate::state::BlockType::DataByte,
+                        old_types,
+                    };
+                    app_state.push_command(command);
+                }
+            }
+        }
+        return true;
+    }
+    true
+}
+
 fn apply_block_type(
     app_state: &mut AppState,
     ui_state: &mut UIState,
@@ -1274,6 +1382,9 @@ fn apply_block_type(
         block_type,
         crate::state::BlockType::LoHi | crate::state::BlockType::HiLo
     );
+
+    // For DataByte conversion, remove user labels in the affected range
+    let is_byte_conversion = block_type == crate::state::BlockType::DataByte;
 
     if ui_state.active_pane == ActivePane::Blocks {
         let blocks = app_state.get_blocks_view_items();
@@ -1289,8 +1400,45 @@ fn apply_block_type(
                 ));
                 return;
             }
+
+            // Remove user labels before converting to DataByte
+            let mut skipped_any = false;
+            if is_byte_conversion {
+                // Find line indices for this block range
+                let start_addr = app_state.origin.wrapping_add(start as u16);
+                let end_addr = app_state.origin.wrapping_add(end as u16);
+
+                // Collect addresses of lines that have labels
+                let mut label_addresses = Vec::new();
+                if let Some(start_idx) = app_state.get_line_index_containing_address(start_addr) {
+                    if let Some(end_idx) = app_state.get_line_index_containing_address(end_addr) {
+                        for line_idx in start_idx..=end_idx {
+                            if let Some(line) = app_state.disassembly.get(line_idx) {
+                                // Check if this line has a label
+                                if app_state.labels.contains_key(&line.address) {
+                                    label_addresses.push(line.address);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Convert all references to these labels to bytes
+                for label_addr in label_addresses {
+                    if !convert_label_references_to_bytes(app_state, label_addr) {
+                        skipped_any = true;
+                    }
+                }
+
+                remove_user_labels_in_range(app_state, start_addr, end_addr);
+            }
+
             app_state.set_block_type_region(block_type, Some(start as usize), end as usize);
-            ui_state.set_status_message(format!("Set block type to {}", block_type));
+            if skipped_any {
+                ui_state.set_status_message(format!("Set block type to {} (some labels had too many references)", block_type));
+            } else {
+                ui_state.set_status_message(format!("Set block type to {}", block_type));
+            }
         }
     } else if let Some(start_index) = ui_state.selection_start {
         let start = start_index.min(ui_state.cursor_index);
@@ -1313,6 +1461,38 @@ fn apply_block_type(
             0
         };
 
+        // Remove user labels before converting to DataByte
+        let mut skipped_any = false;
+        if is_byte_conversion {
+            // Collect addresses of lines that have labels
+            let mut label_addresses = Vec::new();
+            for line_idx in start..=end {
+                if let Some(line) = app_state.disassembly.get(line_idx) {
+                    // Check if this line has a label
+                    if app_state.labels.contains_key(&line.address) {
+                        label_addresses.push(line.address);
+                    }
+                }
+            }
+
+            // Convert all references to these labels to bytes
+            for label_addr in label_addresses {
+                if !convert_label_references_to_bytes(app_state, label_addr) {
+                    skipped_any = true;
+                }
+            }
+
+            if let (Some(start_line), Some(end_line)) =
+                (app_state.disassembly.get(start), app_state.disassembly.get(end))
+            {
+                let start_addr = start_line.address;
+                let end_addr = end_line.address
+                    .wrapping_add(end_line.bytes.len() as u16)
+                    .wrapping_sub(1);
+                remove_user_labels_in_range(app_state, start_addr, end_addr);
+            }
+        }
+
         app_state.set_block_type_region(block_type, Some(start), end);
         ui_state.selection_start = None;
         ui_state.is_visual_mode = false;
@@ -1321,7 +1501,11 @@ fn apply_block_type(
             ui_state.cursor_index = idx;
         }
 
-        ui_state.set_status_message(format!("Set block type to {}", block_type));
+        if skipped_any {
+            ui_state.set_status_message(format!("Set block type to {} (some labels had too many references)", block_type));
+        } else {
+            ui_state.set_status_message(format!("Set block type to {}", block_type));
+        }
     } else {
         // Single line
         if needs_even {
@@ -1331,12 +1515,39 @@ fn apply_block_type(
             ));
             return;
         }
+
+        // Remove user labels before converting to DataByte
+        let mut skipped_any = false;
+        if is_byte_conversion {
+            if let Some(line) = app_state.disassembly.get(ui_state.cursor_index) {
+                // Extract all needed values before any mutable operations
+                let line_addr = line.address;
+                let start_addr = line.address;
+                let end_addr = line.address
+                    .wrapping_add(line.bytes.len() as u16)
+                    .wrapping_sub(1);
+
+                // Now do mutable operations
+                // If this line has a label, convert all references to this label to bytes
+                if app_state.labels.contains_key(&line_addr) {
+                    if !convert_label_references_to_bytes(app_state, line_addr) {
+                        skipped_any = true;
+                    }
+                }
+                remove_user_labels_in_range(app_state, start_addr, end_addr);
+            }
+        }
+
         app_state.set_block_type_region(
             block_type,
             ui_state.selection_start,
             ui_state.cursor_index,
         );
-        ui_state.set_status_message(format!("Set block type to {}", block_type));
+        if skipped_any {
+            ui_state.set_status_message(format!("Set block type to {} (label had too many references)", block_type));
+        } else {
+            ui_state.set_status_message(format!("Set block type to {}", block_type));
+        }
     }
 }
 

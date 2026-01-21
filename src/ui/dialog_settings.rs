@@ -49,6 +49,14 @@ impl Widget for SettingsDialog {
                     "[ ]"
                 }
             ),
+            format!(
+                "{} Sync Hex Dump View",
+                if app_state.system_config.sync_hex_dump {
+                    "[X]"
+                } else {
+                    "[ ]"
+                }
+            ),
             format!("Theme: < {} >", app_state.system_config.theme),
         ];
 
@@ -146,8 +154,8 @@ impl Widget for SettingsDialog {
                     app_state.system_config.theme = new_theme.clone();
                     ui_state.theme = crate::theme::Theme::from_name(&new_theme);
                 } else {
-                    // Limit to 2 (3 items)
-                    if self.selected_index < 2 {
+                    // Limit to 3 (4 items)
+                    if self.selected_index < 3 {
                         self.selected_index += 1;
                     }
                 }
@@ -166,6 +174,10 @@ impl Widget for SettingsDialog {
                         !app_state.system_config.sync_blocks_view;
                     let _ = app_state.system_config.save();
                 } else if self.selected_index == 2 {
+                    app_state.system_config.sync_hex_dump =
+                        !app_state.system_config.sync_hex_dump;
+                    let _ = app_state.system_config.save();
+                } else if self.selected_index == 3 {
                     self.is_selecting_theme = true;
                 }
                 WidgetResult::Handled

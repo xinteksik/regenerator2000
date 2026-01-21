@@ -345,6 +345,76 @@ impl Widget for CharsetView {
             KeyCode::Char('m') if key.modifiers.is_empty() => {
                 WidgetResult::Action(MenuAction::ToggleCharsetMulticolor)
             }
+            KeyCode::Char('b') if key.modifiers.is_empty() => {
+                // Set all matching characters to Byte type
+                let origin = app_state.origin as usize;
+                let base_alignment = 0x400;
+                let aligned_start_addr = (origin / base_alignment) * base_alignment;
+                let char_offset = ui_state.charset_cursor_index * 8;
+                let char_addr = aligned_start_addr + char_offset;
+
+                // Get the 8 bytes of the selected character
+                if char_addr >= origin && char_addr + 8 <= origin + app_state.raw_data.len() {
+                    let start_idx = char_addr - origin;
+                    let char_bytes: Vec<u8> = app_state.raw_data[start_idx..start_idx + 8].to_vec();
+
+                    // Find all matching 8-byte sequences in raw_data (aligned to 8-byte boundaries only)
+                    let mut matches = Vec::new();
+                    let max_matches = 1000; // Safety limit to prevent hanging
+
+                    // Only check 8-byte aligned positions for character data
+                    for i in (0..=(app_state.raw_data.len().saturating_sub(8))).step_by(8) {
+                        if matches.len() >= max_matches {
+                            ui_state.set_status_message(format!(
+                                "Too many matches ({}+), stopping to prevent hang",
+                                max_matches
+                            ));
+                            return WidgetResult::Handled;
+                        }
+
+                        if &app_state.raw_data[i..i + 8] == char_bytes.as_slice() {
+                            matches.push(i);
+                        }
+                    }
+
+                    // Apply DataByte to all matching positions using direct block_types manipulation
+                    if !matches.is_empty() {
+                        // Directly set block types for each 8-byte match
+                        for &match_offset in &matches {
+                            if match_offset + 8 <= app_state.block_types.len() {
+                                // Check if already all DataByte
+                                let needs_change = (0..8).any(|byte_offset| {
+                                    app_state.block_types[match_offset + byte_offset]
+                                        != crate::state::BlockType::DataByte
+                                });
+
+                                if needs_change {
+                                    let range = match_offset..(match_offset + 8);
+                                    let old_types = app_state.block_types[range.clone()].to_vec();
+                                    let command = crate::commands::Command::SetBlockType {
+                                        range,
+                                        new_type: crate::state::BlockType::DataByte,
+                                        old_types,
+                                    };
+                                    command.apply(app_state);
+                                    app_state.push_command(command);
+                                }
+                            }
+                        }
+
+                        app_state.disassemble();
+                        ui_state.set_status_message(format!(
+                            "Set {} matching character(s) to Byte type",
+                            matches.len()
+                        ));
+                    } else {
+                        ui_state.set_status_message("No matching characters found");
+                    }
+                } else {
+                    ui_state.set_status_message("Character out of data range");
+                }
+                WidgetResult::Handled
+            }
             _ => WidgetResult::Ignored,
         }
     }
